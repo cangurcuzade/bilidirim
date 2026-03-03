@@ -38,3 +38,26 @@ def ideasoft_webhook():
 @app.get("/")
 def health():
     return "OK", 200
+from flask import Flask, request, jsonify, send_from_directory, render_template
+import os
+
+app = Flask(__name__)
+
+# ... senin mevcut kodların ...
+
+@app.get("/")
+def home():
+    return """
+    <html>
+      <head>
+        <!-- OneSignal KODUNU BURAYA KOYACAĞIZ -->
+      </head>
+      <body>
+        OK
+      </body>
+    </html>
+    """
+
+@app.get("/OneSignalSDKWorker.js")
+def onesignal_worker():
+    return send_from_directory(os.getcwd(), "OneSignalSDKWorker.js")
