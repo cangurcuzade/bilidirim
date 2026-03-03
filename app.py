@@ -50,7 +50,15 @@ def home():
     return """
     <html>
       <head>
-        <!-- OneSignal KODUNU BURAYA KOYACAĞIZ -->
+        <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+        <script>
+          window.OneSignalDeferred = window.OneSignalDeferred || [];
+          OneSignalDeferred.push(async function(OneSignal) {
+            await OneSignal.init({
+              appId: "3cf6a703-bcef-4ced-8190-ee0901e76229",
+            });
+          });
+        </script>
       </head>
       <body>
         OK
