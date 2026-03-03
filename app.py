@@ -38,33 +38,43 @@ def ideasoft_webhook():
 @app.get("/")
 def health():
     return "OK", 200
-from flask import Flask, request, jsonify, send_from_directory, render_template
+from flask import Flask, send_from_directory
 import os
 
 app = Flask(__name__)
 
-# ... senin mevcut kodların ...
-
 @app.get("/")
 def home():
     return """
-    <html>
-      <head>
-        <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
-        <script>
-          window.OneSignalDeferred = window.OneSignalDeferred || [];
-          OneSignalDeferred.push(async function(OneSignal) {
-            await OneSignal.init({
-              appId: "3cf6a703-bcef-4ced-8190-ee0901e76229",
-            });
-          });
-        </script>
-      </head>
-      <body>
-        OK
-      </body>
-    </html>
-    """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Camlica Push</title>
+
+    <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+    <script>
+      window.OneSignalDeferred = window.OneSignalDeferred || [];
+      OneSignalDeferred.push(async function(OneSignal) {
+        await OneSignal.init({
+          appId: "BURAYA_SENIN_APP_ID",
+        });
+
+        // Otomatik istemezse diye butonla isteyeceğiz
+        window.requestPush = async () => {
+          try { await OneSignal.Slidedown.promptPush(); } catch(e) {}
+        };
+      });
+    </script>
+  </head>
+  <body style="font-family:Arial;padding:20px;">
+    <h2>Push Test</h2>
+    <button onclick="requestPush()" style="font-size:18px;padding:10px 14px;">
+      Bildirim izni iste
+    </button>
+  </body>
+</html>
+"""
 
 @app.get("/OneSignalSDKWorker.js")
 def onesignal_worker():
