@@ -1,81 +1,172 @@
-from flask import Flask, request, jsonify
-import os, requests
+import os
+import time
+import threading
+import requests
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-ONESIGNAL_APP_ID = os.environ.get("ONESIGNAL_APP_ID", "")
-ONESIGNAL_API_KEY = os.environ.get("ONESIGNAL_API_KEY", "")
+# ===== ENV =====
+IDEASOFT_BASE_URL = os.getenv("IDEASOFT_BASE_URL", "").rstrip("/")
+IDEASOFT_CLIENT_ID = os.getenv("IDEASOFT_CLIENT_ID", "")
+IDEASOFT_CLIENT_SECRET = os.getenv("IDEASOFT_CLIENT_SECRET", "")
+IDEASOFT_REFRESH_TOKEN = os.getenv("IDEASOFT_REFRESH_TOKEN", "")
 
-def send_push(title: str, body: str):
-    url = "https://onesignal.com/api/v1/notifications"
+ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID", "")
+ONESIGNAL_REST_API_KEY = os.getenv("ONESIGNAL_REST_API_KEY", "")
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+
+# ===== TOKEN CACHE =====
+access_token = None
+token_expire_time = 0
+
+# ===== LAST SEEN ORDER =====
+LAST_SEEN_FILE = "last_seen.txt"
+
+
+# ================= TOKEN =================
+
+def refresh_access_token():
+    global access_token, token_expire_time
+
+    print("Access token yenileniyor...")
+
+    url = f"{IDEASOFT_BASE_URL}/oauth/v2/token"
+
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": IDEASOFT_CLIENT_ID,
+        "client_secret": IDEASOFT_CLIENT_SECRET,
+        "refresh_token": IDEASOFT_REFRESH_TOKEN,
+    }
+
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+
+    access_token = j["access_token"]
+    expires_in = int(j.get("expires_in", 3600))
+
+    token_expire_time = int(time.time()) + expires_in - 60
+
+    print("Access token yenilendi.")
+
+
+def get_token():
+    global access_token, token_expire_time
+
+    if not access_token or time.time() >= token_expire_time:
+        refresh_access_token()
+
+    return access_token
+
+
+# ================= ORDER FETCH =================
+
+def fetch_orders():
+    url = f"{IDEASOFT_BASE_URL}/admin-api/orders"
     headers = {
-        "Authorization": f"Basic {ONESIGNAL_API_KEY}",
+        "Authorization": f"Bearer {get_token()}",
+        "Accept": "application/json"
+    }
+
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    data = r.json()
+
+    if isinstance(data, dict) and "data" in data:
+        return data["data"]
+
+    return data
+
+
+# ================= PUSH =================
+
+def send_push(order_id):
+    url = "https://onesignal.com/api/v1/notifications"
+
+    headers = {
+        "Authorization": f"Basic {ONESIGNAL_REST_API_KEY}",
         "Content-Type": "application/json"
     }
+
     payload = {
         "app_id": ONESIGNAL_APP_ID,
-        "headings": {"tr": title},
-        "contents": {"tr": body},
         "included_segments": ["Subscribed Users"],
+        "headings": {"tr": "Pişt!"},
+        "contents": {"tr": f"Yeni sipariş geldi! (#{order_id})"}
     }
-    r = requests.post(url, json=payload, headers=headers, timeout=10)
-    return r.status_code, r.text[:500]
 
-@app.post("/ideasoft/webhook")
-def ideasoft_webhook():
-    data = request.get_json(silent=True) or {}
-    oid = data.get("id") or data.get("Id")
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    r.raise_for_status()
 
-    title = "Çamlıca Market"
-    body = "Yeni sipariş geldi ✅" if not oid else f"Yeni sipariş geldi ✅ (ID: {oid})"
+    print("Push gönderildi:", order_id)
 
-    if not ONESIGNAL_APP_ID or not ONESIGNAL_API_KEY:
-        return jsonify({"received": True, "warn": "OneSignal env missing"}), 200
 
-    status, text = send_push(title, body)
-    return jsonify({"received": True, "push_status": status, "push_resp": text}), 200
+# ================= LAST SEEN =================
 
-@app.get("/")
-def health():
-    return "OK", 200
-from flask import Flask, send_from_directory
-import os
+def load_last():
+    try:
+        with open(LAST_SEEN_FILE, "r") as f:
+            return int(f.read().strip())
+    except:
+        return None
 
-app = Flask(__name__)
 
-@app.get("/")
+def save_last(order_id):
+    with open(LAST_SEEN_FILE, "w") as f:
+        f.write(str(order_id))
+
+
+# ================= POLLING =================
+
+def poll_loop():
+    print("Polling başladı...")
+
+    last_seen = load_last()
+
+    while True:
+        try:
+            orders = fetch_orders()
+
+            if not orders:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            newest = int(orders[0]["id"])
+
+            if last_seen is None:
+                save_last(newest)
+                last_seen = newest
+
+            elif newest > last_seen:
+                new_orders = [o for o in orders if int(o["id"]) > last_seen]
+                new_orders.sort(key=lambda x: int(x["id"]))
+
+                for order in new_orders:
+                    oid = int(order["id"])
+                    send_push(oid)
+                    save_last(oid)
+                    last_seen = oid
+
+        except Exception as e:
+            print("Polling hata:", e)
+
+        time.sleep(POLL_SECONDS)
+
+
+# ================= FLASK =================
+
+@app.route("/")
 def home():
-    return """
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Camlica Push</title>
+    return jsonify({"status": "ok"})
 
-    <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
-    <script>
-      window.OneSignalDeferred = window.OneSignalDeferred || [];
-      OneSignalDeferred.push(async function(OneSignal) {
-        await OneSignal.init({
-          appId: "3cf6a703-bcef-4ced-8190-ee0901e76229",
-        });
 
-        // Otomatik istemezse diye butonla isteyeceğiz
-        window.requestPush = async () => {
-          try { await OneSignal.Slidedown.promptPush(); } catch(e) {}
-        };
-      });
-    </script>
-  </head>
-  <body style="font-family:Arial;padding:20px;">
-    <h2>Push Test</h2>
-    <button onclick="requestPush()" style="font-size:18px;padding:10px 14px;">
-      Bildirim izni iste
-    </button>
-  </body>
-</html>
-"""
+def start_background():
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
 
-@app.get("/OneSignalSDKWorker.js")
-def onesignal_worker():
-    return send_from_directory(os.getcwd(), "OneSignalSDKWorker.js")
+
+start_background()
