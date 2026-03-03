@@ -1,38 +1,67 @@
 import os
 import time
 import threading
+from datetime import datetime, timezone
+
 import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ===== ENV =====
-IDEASOFT_BASE_URL = os.getenv("IDEASOFT_BASE_URL", "").rstrip("/")
-IDEASOFT_CLIENT_ID = os.getenv("IDEASOFT_CLIENT_ID", "")
-IDEASOFT_CLIENT_SECRET = os.getenv("IDEASOFT_CLIENT_SECRET", "")
-IDEASOFT_REFRESH_TOKEN = os.getenv("IDEASOFT_REFRESH_TOKEN", "")
+# ---- ENV ----
+IDEASOFT_BASE_URL = (os.getenv("IDEASOFT_BASE_URL") or "").rstrip("/")  # https://camlicasupermarket.myideasoft.com
+IDEASOFT_CLIENT_ID = os.getenv("IDEASOFT_CLIENT_ID") or ""
+IDEASOFT_CLIENT_SECRET = os.getenv("IDEASOFT_CLIENT_SECRET") or ""
+IDEASOFT_REFRESH_TOKEN = os.getenv("IDEASOFT_REFRESH_TOKEN") or ""
 
-ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID", "")
-ONESIGNAL_REST_API_KEY = os.getenv("ONESIGNAL_REST_API_KEY", "")
+# İlk access token env’de var ama yoksa refresh ile zaten alınır
+IDEASOFT_ACCESS_TOKEN = os.getenv("IDEASOFT_ACCESS_TOKEN") or ""
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID") or ""
+ONESIGNAL_API_KEY = os.getenv("ONESIGNAL_API_KEY") or ""
 
-# ===== TOKEN CACHE =====
-access_token = None
-token_expire_time = 0
+# ---- GLOBAL STATE (RAM) ----
+state = {
+    "access_token": IDEASOFT_ACCESS_TOKEN,
+    "last_order_id": None,
+    "last_poll_at": None,
+    "last_error": None,
+}
 
-# ===== LAST SEEN ORDER =====
-LAST_SEEN_FILE = "last_seen.txt"
+session = requests.Session()
+session.headers.update({"User-Agent": "camlica-polling/1.0"})
 
 
-# ================= TOKEN =================
+def onesignal_push(title: str, message: str):
+    """Send push to all subscribed users."""
+    if not (ONESIGNAL_APP_ID and ONESIGNAL_API_KEY):
+        app.logger.warning("OneSignal env eksik: bildirim atlanıyor.")
+        return
+
+    url = "https://onesignal.com/api/v1/notifications"
+    headers = {
+        "Authorization": f"Basic {ONESIGNAL_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "app_id": ONESIGNAL_APP_ID,
+        "included_segments": ["Subscribed Users"],
+        "headings": {"en": title, "tr": title},
+        "contents": {"en": message, "tr": message},
+    }
+
+    r = session.post(url, json=payload, headers=headers, timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"OneSignal hata {r.status_code}: {r.text[:300]}")
+
 
 def refresh_access_token():
-    global access_token, token_expire_time
+    """Refresh access token using refresh_token. Sets state['access_token']."""
+    if not (IDEASOFT_BASE_URL and IDEASOFT_CLIENT_ID and IDEASOFT_CLIENT_SECRET and IDEASOFT_REFRESH_TOKEN):
+        raise RuntimeError("Ideasoft refresh için env eksik (BASE_URL/CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN).")
 
-    print("Access token yenileniyor...")
-
-    url = f"{IDEASOFT_BASE_URL}/oauth/v2/token"
+    token_url = f"{IDEASOFT_BASE_URL}/oauth/v2/token"
 
     data = {
         "grant_type": "refresh_token",
@@ -41,132 +70,131 @@ def refresh_access_token():
         "refresh_token": IDEASOFT_REFRESH_TOKEN,
     }
 
-    r = requests.post(url, data=data, timeout=20)
+    r = session.post(token_url, data=data, timeout=25)
     r.raise_for_status()
-    j = r.json()
+    js = r.json()
 
-    access_token = j["access_token"]
-    expires_in = int(j.get("expires_in", 3600))
+    access = js.get("access_token")
+    if not access:
+        raise RuntimeError(f"Refresh cevap access_token yok: {js}")
 
-    token_expire_time = int(time.time()) + expires_in - 60
+    state["access_token"] = access
+    return access
 
-    print("Access token yenilendi.")
 
-
-def get_token():
-    global access_token, token_expire_time
-
-    if not access_token or time.time() >= token_expire_time:
+def ideasoft_get(path: str, params=None):
+    """Authorized GET to IdeaSoft admin-api"""
+    if not state["access_token"]:
         refresh_access_token()
 
-    return access_token
+    url = f"{IDEASOFT_BASE_URL}{path}"
+    headers = {"Authorization": f"Bearer {state['access_token']}"}
 
+    r = session.get(url, headers=headers, params=params, timeout=25)
 
-# ================= ORDER FETCH =================
+    # Token expired vs → 401/403 olursa bir kere refresh dene
+    if r.status_code in (401, 403):
+        refresh_access_token()
+        headers = {"Authorization": f"Bearer {state['access_token']}"}
+        r = session.get(url, headers=headers, params=params, timeout=25)
 
-def fetch_orders():
-    url = f"{IDEASOFT_BASE_URL}/admin-api/orders"
-    headers = {
-        "Authorization": f"Bearer {get_token()}",
-        "Accept": "application/json"
-    }
-
-    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-
-    data = r.json()
-
-    if isinstance(data, dict) and "data" in data:
-        return data["data"]
-
-    return data
+    return r.json()
 
 
-# ================= PUSH =================
+def fetch_latest_order():
+    """
+    En yeni siparişi çek.
+    IdeaSoft Admin API sipariş listesi çoğu kurulumda /admin-api/orders.
+    """
+    # sadece 1 kayıt alalım
+    data = ideasoft_get("/admin-api/orders", params={"page": 1, "per_page": 1})
 
-def send_push(order_id):
-    url = "https://onesignal.com/api/v1/notifications"
+    # DÖNÜŞ ŞEKLİ ideashop’a göre değişebiliyor:
+    # bazen {"data":[...]} bazen direkt [...]
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        arr = data["data"]
+    elif isinstance(data, list):
+        arr = data
+    else:
+        arr = []
 
-    headers = {
-        "Authorization": f"Basic {ONESIGNAL_REST_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "app_id": ONESIGNAL_APP_ID,
-        "included_segments": ["Subscribed Users"],
-        "headings": {"tr": "Pişt!"},
-        "contents": {"tr": f"Yeni sipariş geldi! (#{order_id})"}
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    r.raise_for_status()
-
-    print("Push gönderildi:", order_id)
-
-
-# ================= LAST SEEN =================
-
-def load_last():
-    try:
-        with open(LAST_SEEN_FILE, "r") as f:
-            return int(f.read().strip())
-    except:
+    if not arr:
         return None
 
-
-def save_last(order_id):
-    with open(LAST_SEEN_FILE, "w") as f:
-        f.write(str(order_id))
+    return arr[0]
 
 
-# ================= POLLING =================
+def polling_loop():
+    """
+    Her 20 sn yeni sipariş var mı kontrol et.
+    Yeni sipariş görünce push at.
+    """
+    app.logger.info("Polling başladı...")
 
-def poll_loop():
-    print("Polling başladı...")
-
-    last_seen = load_last()
+    # İlk çalıştırmada bildirim spam olmasın diye mevcut en yeniyi last_order_id yapıyoruz
+    try:
+        latest = fetch_latest_order()
+        if latest:
+            state["last_order_id"] = latest.get("id") or latest.get("orderId")
+            app.logger.info(f"Başlangıç last_order_id set: {state['last_order_id']}")
+    except Exception as e:
+        state["last_error"] = str(e)
+        app.logger.exception("Başlangıç sipariş çekme hatası")
 
     while True:
         try:
-            orders = fetch_orders()
+            state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
 
-            if not orders:
-                time.sleep(POLL_SECONDS)
-                continue
+            latest = fetch_latest_order()
+            if latest:
+                oid = latest.get("id") or latest.get("orderId")
+                if oid and state["last_order_id"] and str(oid) != str(state["last_order_id"]):
+                    # Yeni sipariş var
+                    state["last_order_id"] = oid
 
-            newest = int(orders[0]["id"])
+                    customer = (latest.get("customer", {}) or {})
+                    cname = customer.get("fullName") or customer.get("name") or "Yeni müşteri"
+                    msg = f"İnternet sitesinden yeni sipariş geldi: {cname}"
 
-            if last_seen is None:
-                save_last(newest)
-                last_seen = newest
+                    app.logger.info(f"Yeni sipariş yakalandı: {oid} -> push atılıyor")
+                    onesignal_push("Pişt!", msg)
 
-            elif newest > last_seen:
-                new_orders = [o for o in orders if int(o["id"]) > last_seen]
-                new_orders.sort(key=lambda x: int(x["id"]))
-
-                for order in new_orders:
-                    oid = int(order["id"])
-                    send_push(oid)
-                    save_last(oid)
-                    last_seen = oid
+            state["last_error"] = None
 
         except Exception as e:
-            print("Polling hata:", e)
+            state["last_error"] = str(e)
+            app.logger.exception("Polling hata")
 
-        time.sleep(POLL_SECONDS)
+        time.sleep(20)
 
 
-# ================= FLASK =================
+# ---- Start background thread once ----
+_started = False
+_lock = threading.Lock()
 
-@app.route("/")
+@app.before_request
+def _start_once():
+    global _started
+    with _lock:
+        if _started:
+            return
+        _started = True
+        t = threading.Thread(target=polling_loop, daemon=True)
+        t.start()
+
+
+# ---- Health endpoints ----
+@app.get("/")
 def home():
-    return jsonify({"status": "ok"})
+    return "OK"
 
-
-def start_background():
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-
-
-start_background()
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "base_url": IDEASOFT_BASE_URL,
+        "last_order_id": state["last_order_id"],
+        "last_poll_at": state["last_poll_at"],
+        "last_error": state["last_error"],
+    })
